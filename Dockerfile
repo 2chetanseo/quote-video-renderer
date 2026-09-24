@@ -12,8 +12,9 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 
-# Copy source.
+# Copy source and bundled assets (audio tracks).
 COPY src ./src
+COPY assets ./assets
 
 # Render sets PORT; default to 10000 locally.
 ENV PORT=10000

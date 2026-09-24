@@ -1,30 +1,26 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 
 // 720x1280 (9:16) keeps memory well within the free 512MB instance while staying HD.
 const W = 720;
 const H = 1280;
 const FONT = process.env.FONT_PATH || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+const ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "assets", "audio");
 
-/**
- * Download a remote URL to a local temp file.
- */
 async function download(url, destPath) {
   const resp = await fetch(url, { redirect: "follow" });
-  if (!resp.ok) {
-    throw new Error(`failed to download ${url}: ${resp.status}`);
-  }
+  if (!resp.ok) throw new Error(`failed to download ${url}: ${resp.status}`);
   const arrayBuf = await resp.arrayBuffer();
   await writeFile(destPath, Buffer.from(arrayBuf));
   return destPath;
 }
 
-/**
- * Wrap text to a max number of characters per line (word-aware).
- */
-function wrapText(text, maxCharsPerLine = 22) {
+/** Word-aware wrap to max chars per line. */
+function wrapText(text, maxCharsPerLine = 24) {
   const words = String(text).replace(/\s+/g, " ").trim().split(" ");
   const lines = [];
   let current = "";
@@ -40,122 +36,157 @@ function wrapText(text, maxCharsPerLine = 22) {
   return lines;
 }
 
-/**
- * Escape a string for use inside an ffmpeg drawtext `text='...'` value.
- * ffmpeg is picky: backslash, colon, single quote, percent all need care.
- */
+/** Escape a string for ffmpeg drawtext text='...'. */
 function escapeDrawtext(s) {
   return String(s)
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
-    .replace(/'/g, "\u2019") // replace straight apostrophe with typographic to avoid quote breakage
+    .replace(/'/g, "\u2019")
     .replace(/%/g, "\\%");
 }
 
-/**
- * Detect whether the background is a video by extension (best-effort).
- * Falls back to treating it as an image on ambiguous types.
- */
 function isVideoUrl(url) {
   return /\.(mp4|mov|webm|mkv|m4v)(\?|$)/i.test(url);
 }
 
 /**
- * Render a vertical quote short.
- * Returns { buffer } with the MP4 bytes.
+ * Build an animated drawtext filter for one line.
+ * Zenith-style: the line fades in and slides up into place, staggered per line,
+ * then stays until the end.
+ *  - appear: time (s) the line starts animating in
+ *  - settleY: final resting y
+ *  - fontSize, color
  */
-export async function renderQuoteVideo({ quote, author, backgroundUrl, audioUrl, duration }) {
+function animatedLine({ text, appear, settleY, fontSize, color }) {
+  const dur = 0.6; // fade/slide duration
+  const rise = 40; // px it slides up while fading in
+  const esc = escapeDrawtext(text);
+  // alpha ramps 0->1 over [appear, appear+dur], then stays 1.
+  const alpha = `if(lt(t,${appear}),0,if(lt(t,${appear + dur}),(t-${appear})/${dur},1))`;
+  // y slides from settleY+rise up to settleY over the same window, then holds.
+  const y = `if(lt(t,${appear}),${settleY + rise},if(lt(t,${appear + dur}),${settleY + rise}-(${rise}*(t-${appear})/${dur}),${settleY}))`;
+  return [
+    `drawtext=fontfile=${FONT}`,
+    `text='${esc}'`,
+    `fontcolor=${color}`,
+    `fontsize=${fontSize}`,
+    `x=(w-text_w)/2`,
+    `y=${y}`,
+    `alpha=${alpha}`,
+    `shadowcolor=black@0.8`,
+    `shadowx=3`,
+    `shadowy=3`,
+  ].join(":");
+}
+
+/**
+ * Render a vertical quote short with animated text.
+ *
+ * Params:
+ *  - quote (required)
+ *  - author (optional)
+ *  - background: "black" | image/video URL  (backgroundUrl kept for compatibility)
+ *  - audioUrl (optional): remote URL OR a local asset name like "asset:zenith"
+ *  - duration (seconds)
+ * Returns { buffer }.
+ */
+export async function renderQuoteVideo({ quote, author, backgroundUrl, background, audioUrl, duration }) {
   const work = await mkdtemp(join(tmpdir(), "qvr-"));
-  const bgIsVideo = isVideoUrl(backgroundUrl);
-  const bgPath = join(work, bgIsVideo ? "bg.mp4" : "bg.img");
   const outPath = join(work, "out.mp4");
 
+  // Normalize background: "black" or a URL.
+  const bg = background || backgroundUrl || "black";
+  const useBlack = !bg || bg === "black";
+  const bgIsVideo = !useBlack && isVideoUrl(bg);
+  const bgPath = useBlack ? "" : join(work, bgIsVideo ? "bg.mp4" : "bg.img");
+
   try {
-    await download(backgroundUrl, bgPath);
+    if (!useBlack) {
+      await download(bg, bgPath);
+    }
+
+    // Resolve audio: local asset (asset:<name>) or remote URL.
     let audioPath = "";
     if (audioUrl) {
-      audioPath = join(work, "audio.m4a");
       try {
-        await download(audioUrl, audioPath);
+        if (audioUrl.startsWith("asset:")) {
+          const name = audioUrl.slice("asset:".length);
+          const candidate = join(ASSETS_DIR, `${name}.mp3`);
+          if (existsSync(candidate)) audioPath = candidate;
+        } else {
+          audioPath = join(work, "audio.m4a");
+          await download(audioUrl, audioPath);
+        }
       } catch (e) {
-        console.warn("audio download failed, continuing without audio:", e.message);
+        console.warn("audio unavailable, continuing silent:", e.message);
         audioPath = "";
       }
     }
 
-    // Build the drawtext filter chain for the wrapped quote lines + author.
-    // Sized for the 720px-wide canvas.
+    // Text layout.
     const lines = wrapText(quote, 24);
-    const fontSize = lines.length > 5 ? 40 : 50;
-    const lineSpacing = Math.round(fontSize * 1.35);
-    const totalTextHeight = lines.length * lineSpacing;
-    const startY = Math.round(H / 2 - totalTextHeight / 2);
+    const fontSize = lines.length > 5 ? 40 : 52;
+    const lineSpacing = Math.round(fontSize * 1.4);
+    const hasAuthor = author && author.trim() && author.trim().toLowerCase() !== "unknown";
+    const blockH = lines.length * lineSpacing + (hasAuthor ? 60 : 0);
+    const startY = Math.round(H / 2 - blockH / 2);
 
-    const drawtexts = lines.map((line, i) => {
-      const y = startY + i * lineSpacing;
-      return [
-        `drawtext=fontfile=${FONT}`,
-        `text='${escapeDrawtext(line)}'`,
-        `fontcolor=white`,
-        `fontsize=${fontSize}`,
-        `x=(w-text_w)/2`,
-        `y=${y}`,
-        `shadowcolor=black@0.8`,
-        `shadowx=3`,
-        `shadowy=3`,
-      ].join(":");
-    });
-
-    if (author && author.trim() && author.trim().toLowerCase() !== "unknown") {
-      const authorY = startY + lines.length * lineSpacing + 40;
+    // Staggered appear times (line by line).
+    const stagger = 0.45;
+    const drawtexts = lines.map((line, i) =>
+      animatedLine({
+        text: line,
+        appear: 0.3 + i * stagger,
+        settleY: startY + i * lineSpacing,
+        fontSize,
+        color: "white",
+      })
+    );
+    if (hasAuthor) {
       drawtexts.push(
-        [
-          `drawtext=fontfile=${FONT}`,
-          `text='${escapeDrawtext("- " + author.trim())}'`,
-          `fontcolor=0xFFD700`,
-          `fontsize=30`,
-          `x=(w-text_w)/2`,
-          `y=${authorY}`,
-          `shadowcolor=black@0.8`,
-          `shadowx=2`,
-          `shadowy=2`,
-        ].join(":")
+        animatedLine({
+          text: "- " + author.trim(),
+          appear: 0.3 + lines.length * stagger,
+          settleY: startY + lines.length * lineSpacing + 30,
+          fontSize: 30,
+          color: "0xFFD700",
+        })
       );
     }
 
-    // Scale + crop background to exactly 1080x1920 (cover), add a dark overlay for text legibility.
-    const scaleCrop =
-      `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},` +
-      `drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.35:t=fill`;
+    // Base layer.
+    let baseFilter;
+    if (useBlack) {
+      // Solid black is generated by the color source input; just add a subtle vignette-free box (noop) then text.
+      baseFilter = drawtexts.join(",");
+    } else {
+      const scaleCrop =
+        `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},` +
+        `drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.4:t=fill`;
+      baseFilter = [scaleCrop, ...drawtexts].join(",");
+    }
 
-    const videoFilter = [scaleCrop, ...drawtexts].join(",");
-
-    // Assemble ffmpeg args.
     const args = ["-y"];
 
-    if (bgIsVideo) {
-      // Loop the video to fill duration if it is shorter.
+    if (useBlack) {
+      args.push("-f", "lavfi", "-i", `color=c=black:s=${W}x${H}:r=24:d=${duration}`);
+    } else if (bgIsVideo) {
       args.push("-stream_loop", "-1", "-i", bgPath);
     } else {
-      // Static image looped into a video stream.
       args.push("-loop", "1", "-i", bgPath);
     }
 
-    if (audioPath) {
-      args.push("-i", audioPath);
-    }
+    if (audioPath) args.push("-i", audioPath);
 
-    // Memory-frugal settings so the encode fits the free 512MB Render instance:
-    // ultrafast preset + single thread + capped rate/refs keeps RAM low.
+    // Memory-frugal encode for the free 512MB instance.
     args.push(
       "-t", String(duration),
-      "-vf", videoFilter,
+      "-vf", baseFilter,
       "-r", "24",
       "-threads", "1",
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
       "-preset", "ultrafast",
-      "-tune", "stillimage",
       "-crf", "28",
       "-x264-params", "ref=1:bframes=0:rc-lookahead=10",
       "-max_muxing_queue_size", "1024",
@@ -171,11 +202,9 @@ export async function renderQuoteVideo({ quote, author, backgroundUrl, audioUrl,
     args.push(outPath);
 
     await runFfmpeg(args);
-
     const buffer = await readFile(outPath);
     return { buffer };
   } finally {
-    // Best-effort cleanup of temp files.
     rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
