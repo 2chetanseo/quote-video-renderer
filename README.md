@@ -4,6 +4,10 @@ A free-tier, self-hosted video renderer for vertical "quote shorts" (9:16, 1080x
 It runs **ffmpeg** inside a Docker container on **Render's free plan** — something Cloudflare's
 free Workers plan cannot do (no ffmpeg / native binaries).
 
+Output is **720x1280** (9:16) with memory-frugal ffmpeg settings (ultrafast preset, single thread,
+lower bitrate) so the encode fits Render's free 512MB instance. Renders take ~35-70s including a
+possible cold-start wake, so the caller should use a generous timeout (n8n uses 180s).
+
 It is called by the n8n workflow **"Quote Shorts Factory - Telegram + JSON2Video"** and replaces
 the paid JSON2Video render step with a $0 self-hosted renderer.
 
@@ -72,3 +76,16 @@ curl -X POST http://localhost:10000/render \
 In the workflow, a single **HTTP Request** node does `POST {RENDER_RENDER_URL}/render` with the
 quote/author/background/audio, `responseFormat: file`, and the result is sent to Telegram via
 `sendVideo`. No polling loop needed — the response is the MP4.
+
+## n8n entrypoint: polling (no webhook)
+
+The n8n instance is served on a non-standard port, so Telegram's webhook (which requires
+443/80/88/8443) can't be used. The workflow instead uses a Schedule Trigger + HTTP `getUpdates`
+poll (every 60s), tracking the update offset in workflow static data. chatId is passed as a string
+to the Telegram send nodes.
+
+## AI: Cloudflare Workers AI (free)
+
+The quote/caption step uses Cloudflare Workers AI (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) via
+its OpenAI-compatible `/v1/chat/completions` endpoint. Free tier is 10,000 neurons/day; each quote
+generation costs ~25 neurons (~400/day free). No OpenAI account needed.
