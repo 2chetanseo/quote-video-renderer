@@ -15,8 +15,16 @@ const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || "";
 const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
 const CF_IMAGE_MODEL = process.env.CF_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const AUDIO_DIR = join(ROOT, "assets", "audio");
+// Generated background images are cached here and served via /img/:id so the
+// render step can fetch them back by URL.
+const IMG_CACHE = join(tmpdir(), "qvr-images");
+try { mkdirSync(IMG_CACHE, { recursive: true }); } catch {}
 
 function requireKey(req, res) {
   if (!API_KEY) return true;
@@ -28,6 +36,9 @@ function requireKey(req, res) {
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "quote-video-renderer", ts: Date.now() });
 });
+
+// Serve cached generated background images (used by the render step).
+app.use("/img", express.static(IMG_CACHE, { maxAge: "1h" }));
 
 app.get("/", (_req, res) => {
   res.type("text/plain").send("quote-video-renderer running. Endpoints: /render, /audios, /image, /health");
@@ -86,21 +97,28 @@ app.post("/image", async (req, res) => {
     }
 
     // flux-1-schnell returns JSON { result: { image: "<base64>" } }.
+    let buf;
     const ct = cfResp.headers.get("content-type") || "";
     if (ct.includes("application/json")) {
       const data = await cfResp.json();
       const b64 = data?.result?.image;
       if (!b64) return res.status(502).json({ error: "cf_image_empty" });
-      const buf = Buffer.from(b64, "base64");
-      res.setHeader("Content-Type", "image/jpeg");
-      res.setHeader("Content-Length", buf.length);
-      return res.status(200).send(buf);
+      buf = Buffer.from(b64, "base64");
+    } else {
+      buf = Buffer.from(await cfResp.arrayBuffer());
     }
-    // Some models return the image bytes directly.
-    const arr = Buffer.from(await cfResp.arrayBuffer());
-    res.setHeader("Content-Type", "image/png");
-    res.setHeader("Content-Length", arr.length);
-    return res.status(200).send(arr);
+
+    // Cache it and return both a URL (for /render) and the bytes inline is not needed;
+    // n8n needs the bytes to show the user AND a URL for rendering. Return the image
+    // bytes, and put the retrieval URL in a header so n8n can grab both.
+    const id = randomUUID().slice(0, 12);
+    const file = join(IMG_CACHE, `${id}.jpg`);
+    writeFileSync(file, buf);
+    const publicUrl = `${req.protocol}://${req.get("host")}/img/${id}.jpg`;
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("X-Image-Url", publicUrl);
+    res.setHeader("Content-Length", buf.length);
+    return res.status(200).send(buf);
   } catch (err) {
     console.error("image error:", err);
     return res.status(500).json({ error: "image_failed", detail: String(err?.message || err) });
