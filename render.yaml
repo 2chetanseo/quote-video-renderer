@@ -1,0 +1,28 @@
+# Render Blueprint. Import this repo at https://dashboard.render.com/blueprints
+# or create the service manually. Free plan, Docker runtime (ffmpeg needs a container).
+services:
+  - type: web
+    name: quote-video-renderer
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Optional shared secret. Set the same value in n8n's HTTP Request header x-api-key.
+      # Generate a value in the Render dashboard, or remove to disable auth.
+      - key: RENDER_API_KEY
+        generateValue: true
+
+  # Free keep-warm cron: pings /health so the free web service does not cold-start
+  # during your active hours. Replace <YOUR_SERVICE_URL> after first deploy.
+  # (Cron jobs have a $1/mo minimum if not on free allowance; comment out if you
+  #  prefer to accept cold starts and stay strictly $0.)
+  # - type: cron
+  #   name: keep-warm
+  #   runtime: docker
+  #   plan: free
+  #   schedule: "*/10 * * * *"
+  #   dockerfilePath: ./Dockerfile
+  #   dockerCommand: "sh -c 'curl -fsS https://<YOUR_SERVICE_URL>/health || true'"
