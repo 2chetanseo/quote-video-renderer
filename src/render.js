@@ -3,8 +3,9 @@ import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const W = 1080;
-const H = 1920;
+// 720x1280 (9:16) keeps memory well within the free 512MB instance while staying HD.
+const W = 720;
+const H = 1280;
 const FONT = process.env.FONT_PATH || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
 
 /**
@@ -83,8 +84,9 @@ export async function renderQuoteVideo({ quote, author, backgroundUrl, audioUrl,
     }
 
     // Build the drawtext filter chain for the wrapped quote lines + author.
-    const lines = wrapText(quote, 22);
-    const fontSize = lines.length > 5 ? 58 : 72;
+    // Sized for the 720px-wide canvas.
+    const lines = wrapText(quote, 24);
+    const fontSize = lines.length > 5 ? 40 : 50;
     const lineSpacing = Math.round(fontSize * 1.35);
     const totalTextHeight = lines.length * lineSpacing;
     const startY = Math.round(H / 2 - totalTextHeight / 2);
@@ -111,7 +113,7 @@ export async function renderQuoteVideo({ quote, author, backgroundUrl, audioUrl,
           `drawtext=fontfile=${FONT}`,
           `text='${escapeDrawtext("- " + author.trim())}'`,
           `fontcolor=0xFFD700`,
-          `fontsize=44`,
+          `fontsize=30`,
           `x=(w-text_w)/2`,
           `y=${authorY}`,
           `shadowcolor=black@0.8`,
@@ -143,18 +145,25 @@ export async function renderQuoteVideo({ quote, author, backgroundUrl, audioUrl,
       args.push("-i", audioPath);
     }
 
+    // Memory-frugal settings so the encode fits the free 512MB Render instance:
+    // ultrafast preset + single thread + capped rate/refs keeps RAM low.
     args.push(
       "-t", String(duration),
       "-vf", videoFilter,
-      "-r", "30",
+      "-r", "24",
+      "-threads", "1",
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
-      "-preset", "veryfast",
+      "-preset", "ultrafast",
+      "-tune", "stillimage",
+      "-crf", "28",
+      "-x264-params", "ref=1:bframes=0:rc-lookahead=10",
+      "-max_muxing_queue_size", "1024",
       "-movflags", "+faststart"
     );
 
     if (audioPath) {
-      args.push("-c:a", "aac", "-b:a", "128k", "-shortest", "-map", "0:v:0", "-map", "1:a:0");
+      args.push("-c:a", "aac", "-b:a", "96k", "-shortest", "-map", "0:v:0", "-map", "1:a:0");
     } else {
       args.push("-an");
     }
