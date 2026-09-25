@@ -3,17 +3,13 @@ import { readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderQuoteVideo } from "./render.js";
+import { cfQuote, cfImage, cfConfigured, cfAccountCount } from "./cloudflare.js";
 
 const app = express();
 app.use(express.json({ limit: "4mb" }));
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.RENDER_API_KEY || "";
-
-// Cloudflare Workers AI (for AI image backgrounds). Set these env vars on Render.
-const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || "";
-const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
-const CF_IMAGE_MODEL = process.env.CF_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -34,7 +30,34 @@ function requireKey(req, res) {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "quote-video-renderer", ts: Date.now() });
+  res.json({ ok: true, service: "quote-video-renderer", ts: Date.now(), cfAccounts: cfAccountCount() });
+});
+
+/**
+ * POST /quote  { "idea": "..." }
+ * Generates the quote JSON via Cloudflare Workers AI, rotating across accounts
+ * to avoid rate limits. Returns { quote, author, description, hashtags }.
+ */
+app.post("/quote", async (req, res) => {
+  if (!requireKey(req, res)) return;
+  try {
+    if (!cfConfigured()) return res.status(501).json({ error: "cf_not_configured" });
+    const idea = (req.body && req.body.idea) || "";
+    if (!idea) return res.status(400).json({ error: "idea is required" });
+    const p = await cfQuote(idea);
+    const hashtags = Array.isArray(p.hashtags)
+      ? p.hashtags.map((t) => "#" + String(t).replace(/^#+/, "").replace(/\s+/g, "")).join(" ")
+      : "";
+    return res.json({
+      quote: (p.quote || "").toString().trim(),
+      author: (p.author || "Unknown").toString().trim(),
+      description: (p.description || "").toString().trim(),
+      hashtags,
+    });
+  } catch (err) {
+    console.error("quote error:", err);
+    return res.status(502).json({ error: "quote_failed", detail: String(err?.message || err) });
+  }
 });
 
 // Serve cached generated background images (used by the render step).
@@ -72,45 +95,17 @@ app.get("/audios", (_req, res) => {
 app.post("/image", async (req, res) => {
   if (!requireKey(req, res)) return;
   try {
-    if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
-      return res.status(501).json({ error: "image_gen_not_configured", detail: "Set CF_ACCOUNT_ID and CF_API_TOKEN env vars." });
+    if (!cfConfigured()) {
+      return res.status(501).json({ error: "image_gen_not_configured", detail: "Configure Cloudflare accounts (CF_ACCOUNTS or CF_ACCOUNT_ID/CF_API_TOKEN)." });
     }
     const { prompt } = req.body || {};
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "prompt is required (string)" });
     }
 
-    const fullPrompt =
-      `Cinematic vertical 9:16 background for a motivational quote short. ${prompt}. ` +
-      `Moody, dramatic lighting, dark tones so white text is readable, no text, no watermark, high detail.`;
+    // Generate via the rotation client (auto-fails over across accounts on 429/quota).
+    const buf = await cfImage(prompt);
 
-    const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_IMAGE_MODEL}`;
-    const cfResp = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${CF_API_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: fullPrompt }),
-    });
-
-    if (!cfResp.ok) {
-      const t = await cfResp.text();
-      return res.status(502).json({ error: "cf_image_failed", detail: t.slice(0, 400) });
-    }
-
-    // flux-1-schnell returns JSON { result: { image: "<base64>" } }.
-    let buf;
-    const ct = cfResp.headers.get("content-type") || "";
-    if (ct.includes("application/json")) {
-      const data = await cfResp.json();
-      const b64 = data?.result?.image;
-      if (!b64) return res.status(502).json({ error: "cf_image_empty" });
-      buf = Buffer.from(b64, "base64");
-    } else {
-      buf = Buffer.from(await cfResp.arrayBuffer());
-    }
-
-    // Cache it and return both a URL (for /render) and the bytes inline is not needed;
-    // n8n needs the bytes to show the user AND a URL for rendering. Return the image
-    // bytes, and put the retrieval URL in a header so n8n can grab both.
     const id = randomUUID().slice(0, 12);
     const file = join(IMG_CACHE, `${id}.jpg`);
     writeFileSync(file, buf);
