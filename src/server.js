@@ -109,7 +109,8 @@ app.post("/image", async (req, res) => {
     const id = randomUUID().slice(0, 12);
     const file = join(IMG_CACHE, `${id}.jpg`);
     writeFileSync(file, buf);
-    const publicUrl = `${req.protocol}://${req.get("host")}/img/${id}.jpg`;
+    // Force https (Render terminates TLS at the proxy; req.protocol may read http).
+    const publicUrl = `https://${req.get("host")}/img/${id}.jpg`;
     res.setHeader("Content-Type", "image/jpeg");
     res.setHeader("X-Image-Url", publicUrl);
     res.setHeader("Content-Length", buf.length);
